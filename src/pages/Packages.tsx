@@ -1,502 +1,341 @@
-import { Check, Crown, Loader2, Package, Star } from 'lucide-react';
-import React, { useEffect, useState } from 'react';
-import { Package as PackageType, User } from '../types';
-import { supabase } from '../lib/supabase';
-import { setCurrentUser, getCurrentUser } from '../utils/auth';
-import { getAllPackages, updateUser, createTransaction } from '../utils/database';
+import React, { useState, useEffect } from 'react';
+import { Shield, Check, Crown, Diamond, Star, Package, ArrowRight, Lock, CheckCircle2 } from 'lucide-react';
+import { MLMService } from '../lib/supabase';
+import { Package, User, UserPackage, PackageUpgradeCheck } from '../types';
+import toast from 'react-hot-toast';
 
-interface PackageWithFallback extends PackageType {
-  price: number;
-  roi: number;
-  benefits: string[];
+interface PackagesProps {
+  user: User;
 }
 
-const Packages: React.FC = () => {
-  const [user, setUser] = useState<User | null>(null);
-  const [packages, setPackages] = useState<PackageWithFallback[]>([]);
-  const [selectedPackage, setSelectedPackage] = useState<PackageWithFallback | null>(null);
-  const [showConfirmation, setShowConfirmation] = useState(false);
-  const [loading, setLoading] = useState({
-    page: true,
-    activation: false
-  });
-  const [error, setError] = useState<string | null>(null);
+const packageIcons = {
+  starter: Package,
+  silver: Shield,
+  gold: Crown,
+  platinum: Star,
+  diamond: Diamond
+};
+
+const packageColors = {
+  starter: 'from-green-500 to-green-600',
+  silver: 'from-gray-400 to-gray-500',
+  gold: 'from-yellow-400 to-yellow-500',
+  platinum: 'from-blue-500 to-blue-600',
+  diamond: 'from-purple-500 to-purple-600'
+};
+
+const packageBorders = {
+  starter: 'border-green-500',
+  silver: 'border-gray-400',
+  gold: 'border-yellow-400',
+  platinum: 'border-blue-500',
+  diamond: 'border-purple-500'
+};
+
+export default function Packages({ user }: PackagesProps) {
+  const [packages, setPackages] = useState<Package[]>([]);
+  const [userPackages, setUserPackages] = useState<UserPackage[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [purchasingPackage, setPurchasingPackage] = useState<string | null>(null);
 
   useEffect(() => {
-    const loadData = async () => {
-      try {
-        setLoading(prev => ({ ...prev, page: true }));
-        setError(null);
-        
-        const currentUser = getCurrentUser();
-        if (!currentUser) {
-          throw new Error('User not authenticated');
-        }
-        
-        // Fetch the latest user profile from the database
-        const { data: freshUser } = await supabase
-          .from('profiles')
-          .select('*')
-          .eq('id', currentUser.id)
-          .single();
-        if (!freshUser) throw new Error('User not found');
-        setCurrentUser(freshUser);
-        setUser(freshUser);
-        const availablePackages = await getAllPackages();
-        
-        setPackages(availablePackages.map(pkg => ({
-          ...pkg,
-          price: pkg.price || 0,
-          roi: pkg.roi || 0,
-          benefits: pkg.benefits || []
-        })));
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load packages');
-      } finally {
-        setLoading(prev => ({ ...prev, page: false }));
-      }
-    };
-
     loadData();
   }, []);
 
-  const handlePackageSelect = (pkg: PackageWithFallback) => {
-    // Check if user can activate this package (must be higher price than current)
-    if (user?.package_id) {
-      const currentPackage = packages.find(p => p.id === user.package_id);
-      if (currentPackage && pkg.price <= currentPackage.price) {
-        setError('You can only upgrade to a higher-priced package. Please select a more expensive package.');
-        return;
-      }
+  const loadData = async () => {
+    try {
+      const [packagesData, userPackagesData] = await Promise.all([
+        MLMService.getPackages(),
+        MLMService.getUserPackages(user.id)
+      ]);
+      setPackages(packagesData);
+      setUserPackages(userPackagesData);
+    } catch (error) {
+      console.error('Error loading data:', error);
+      toast.error('Failed to load packages');
+    } finally {
+      setLoading(false);
     }
-    
-    setSelectedPackage(pkg);
-    setShowConfirmation(true);
-    setError(null);
   };
 
-  const handlePackageActivation = async () => {
-    console.log('handlePackageActivation called', { user, selectedPackage });
-    if (!user || !selectedPackage) {
-      console.warn('Activation aborted: user or selectedPackage is null', { user, selectedPackage });
+  const checkUpgradeEligibility = async (packageId: string): Promise<PackageUpgradeCheck> => {
+    try {
+      return await MLMService.canUpgradeToPackage(user.id, packageId);
+    } catch (error) {
+      console.error('Error checking upgrade eligibility:', error);
+      return { canUpgrade: false, reason: 'Error checking eligibility' };
+    }
+  };
+
+  const handlePurchase = async (pkg: Package) => {
+    const eligibility = await checkUpgradeEligibility(pkg.id);
+    
+    if (!eligibility.canUpgrade) {
+      toast.error(eligibility.reason || 'Cannot upgrade to this package');
       return;
     }
 
-    try {
-      setLoading(prev => ({ ...prev, activation: true }));
-      setError(null);
+    const confirmed = window.confirm(
+      `Are you sure you want to purchase ${pkg.name} package for ₹${pkg.price.toLocaleString()}?`
+    );
 
-      const userBalance = user.wallet_balance || 0;
-      const packagePrice = selectedPackage.price || 0;
-      console.log('User balance:', userBalance, 'Package price:', packagePrice);
+    if (!confirmed) return;
 
-      // Sequential upgrade enforcement: only allow upgrade to the next package in price order
-      const sortedPackages = [...packages].sort((a, b) => a.price - b.price);
-      const currentIndex = user.package_id ? sortedPackages.findIndex(p => p.id === user.package_id) : -1;
-      const nextIndex = currentIndex + 1;
-      if (nextIndex >= sortedPackages.length || sortedPackages[nextIndex].id !== selectedPackage.id) {
-        setError('You can only upgrade to the next package in sequence.');
-        console.warn('Activation aborted: not next package in sequence', { currentIndex, nextIndex, selectedPackage });
-        return;
-      }
-
-      if (userBalance < packagePrice) {
-        setError('Insufficient balance! Please deposit GPK Coin first.');
-        console.warn('Activation aborted: insufficient balance', { userBalance, packagePrice });
-        return;
-      }
-
-      // Debug: Print Supabase Auth UID and profile ID
-      const { data: authUser } = await supabase.auth.getUser();
-      console.log('Supabase Auth UID:', authUser?.user?.id, 'Profile ID:', user.id);
-
-      // Use correct column names for update
-      const updatedUser = await updateUser(user.id, {
-        package_id: String(selectedPackage.id),
-        is_active: true,
-        wallet_balance: userBalance - packagePrice
-      });
-
-      if (updatedUser) {
-        // Log the upgrade transaction
-        try {
-          const txResult = await createTransaction({
-            user_id: user.id,
-            type: 'upgrade',
-            amount: packagePrice,
-            tx_hash: null,
-            wallet_address: null,
-            status: 'verified',
-            admin_fee: 0,
-            reference_id: selectedPackage.id,
-            date: new Date().toISOString(),
-            description: `Package Upgrade: ${selectedPackage.name}`
-          });
-          if (!txResult) {
-            console.error('Failed to insert upgrade transaction: No result returned');
-            setError('Upgrade successful, but failed to log transaction. Please contact support.');
-          }
-        } catch (txError: any) {
-          // Log the full error details for debugging
-          if (txError && txError.message) {
-            console.error('Error inserting upgrade transaction:', txError.message, txError.details || '', txError.hint || '', txError.code || '');
-          } else {
-            console.error('Error inserting upgrade transaction:', txError);
-          }
-          setError('Upgrade successful, but failed to log transaction. Please contact support.');
-        }
-        setUser(updatedUser);
-        setShowConfirmation(false);
-        setSelectedPackage(null);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to activate package');
-    } finally {
-      setLoading(prev => ({ ...prev, activation: false }));
-    }
-  };
-
-  const getPackageIcon = (packageName: string) => {
-    switch (packageName.toLowerCase()) {
-      case 'starter': return <Package className="h-8 w-8" />;
-      case 'silver': return <Star className="h-8 w-8" />;
-      case 'gold': return <Crown className="h-8 w-8" />;
-      case 'platinum': return <Crown className="h-8 w-8 text-purple-500" />;
-      case 'diamond': return <Crown className="h-8 w-8 text-blue-500" />;
-      default: return <Package className="h-8 w-8" />;
-    }
-  };
-
-  const getPackageGradient = (packageName: string) => {
-    switch (packageName.toLowerCase()) {
-      case 'starter': return 'from-blue-500 to-blue-600';
-      case 'silver': return 'from-gray-400 to-gray-600';
-      case 'gold': return 'from-yellow-400 to-yellow-600';
-      case 'platinum': return 'from-purple-500 to-purple-700';
-      case 'diamond': return 'from-blue-500 to-blue-700';
-      default: return 'from-blue-500 to-blue-600';
-    }
-  };
-
-  const formatNumber = (value: number | undefined, decimals = 2) => {
-    return (value || 0).toFixed(decimals);
-  };
-
-  // Helper function to get current user's package price
-  const getCurrentPackagePrice = () => {
-    if (!user?.package_id) return 0;
-    return packages.find(p => p.id === user.package_id)?.price || 0;
-  };
-
-  // Helper function to check if package can be activated
-  const canActivatePackage = (packagePrice: number) => {
-    const userBalance = user?.wallet_balance || 0;
-    const currentPackagePrice = getCurrentPackagePrice();
+    setPurchasingPackage(pkg.id);
     
-    return userBalance >= packagePrice && (currentPackagePrice === 0 || packagePrice > currentPackagePrice);
+    try {
+      await MLMService.purchasePackage(user.id, pkg.id, pkg.price);
+      toast.success(`Successfully purchased ${pkg.name} package!`);
+      await loadData(); // Reload data to reflect changes
+    } catch (error) {
+      console.error('Error purchasing package:', error);
+      toast.error('Failed to purchase package');
+    } finally {
+      setPurchasingPackage(null);
+    }
   };
 
-  // Helper function to get package status
-  const getPackageStatus = (pkg: PackageWithFallback) => {
-    if (user?.package_id === pkg.id) {
-      return 'active';
-    }
-    if (!canActivatePackage(pkg.price)) {
-      if ((user?.wallet_balance || 0) < pkg.price) {
-        return 'insufficient_balance';
-      }
-      if (getCurrentPackagePrice() >= pkg.price) {
-        return 'upgrade_required';
-      }
-    }
-    return 'available';
+  const hasPackage = (packageId: string) => {
+    return userPackages.some(up => up.package_id === packageId);
   };
 
-  if (loading.page) {
-    return (
-      <div className="flex justify-center items-center h-64">
-        <Loader2 className="h-12 w-12 animate-spin text-blue-500" />
-      </div>
-    );
-  }
+  const getPackageStatus = (pkg: Package) => {
+    if (hasPackage(pkg.id)) {
+      return { status: 'owned', text: 'Purchased', icon: CheckCircle2, color: 'text-green-600' };
+    }
+    
+    // Check if this is the next package in sequence
+    const packageOrder = ['starter', 'silver', 'gold', 'platinum', 'diamond'];
+    const currentIndex = packageOrder.indexOf(pkg.id);
+    
+    if (currentIndex === 0) {
+      return { status: 'available', text: 'Purchase', icon: ArrowRight, color: 'text-blue-600' };
+    }
+    
+    const previousPackageId = packageOrder[currentIndex - 1];
+    const hasPreviousPackage = hasPackage(previousPackageId);
+    
+    if (hasPreviousPackage) {
+      return { status: 'available', text: 'Upgrade', icon: ArrowRight, color: 'text-blue-600' };
+    }
+    
+    return { status: 'locked', text: 'Locked', icon: Lock, color: 'text-gray-400' };
+  };
 
-  if (error) {
-    return (
-      <div className="bg-red-50 border border-red-200 text-red-700 p-4 rounded-lg">
-        {error}
-        <button 
-          onClick={() => window.location.reload()}
-          className="mt-2 px-4 py-2 bg-red-100 text-red-700 rounded hover:bg-red-200"
-        >
-          Refresh Page
-        </button>
-      </div>
-    );
-  }
+  const formatCurrency = (amount: number) => {
+    return new Intl.NumberFormat('en-IN', {
+      style: 'currency',
+      currency: 'INR',
+      maximumFractionDigits: 0
+    }).format(amount);
+  };
 
-  if (!user) {
+  if (loading) {
     return (
-      <div className="bg-yellow-50 border border-yellow-200 text-yellow-700 p-4 rounded-lg">
-        User not found. Please login again.
+      <div className="min-h-screen bg-gray-50 py-12">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+            <p className="mt-4 text-gray-600">Loading packages...</p>
+          </div>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="text-center">
-        <h1 className="text-3xl font-bold text-gray-900">Choose Your Package</h1>
-        <p className="mt-2 text-gray-600">Select the perfect package to start your MLM journey</p>
-        <div className="mt-4 inline-flex items-center space-x-2 bg-blue-50 text-blue-700 px-4 py-2 rounded-lg">
-          <span className="font-medium">Current Balance:</span>
-          <span className="font-bold">{formatNumber(user.wallet_balance)} GPK</span>
+    <div className="min-h-screen bg-gray-50 py-12">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        {/* Header */}
+        <div className="text-center mb-12">
+          <h1 className="text-4xl font-bold text-gray-900 mb-4">GrowwPark MLM Packages</h1>
+          <p className="text-xl text-gray-600 max-w-3xl mx-auto">
+            Choose your investment package and start your journey with GrowwPark. 
+            Upgrade step-by-step to unlock higher income potential and global royalty benefits.
+          </p>
         </div>
 
-        {/* Package Progression Status */}
-        {user.package_id && (
-          <div className="mt-4">
-            {(() => {
-              const currentPackage = packages.find(p => p.id === user.package_id);
-              const nextPackage = packages.find(p => p.price > getCurrentPackagePrice());
-              
-              return (
-                <div className="bg-green-50 border border-green-200 rounded-lg p-4 max-w-md mx-auto">
-                  <div className="flex items-center justify-center mb-2">
-            <Check className="h-5 w-5 text-green-600 mr-2" />
-            <span className="text-green-800 font-medium">
-                      Current: {currentPackage?.name || 'Unknown Package'}
-            </span>
-          </div>
-                  {nextPackage && (
-                    <div className="text-sm text-green-700">
-                      Next upgrade available: {nextPackage.name} ({formatNumber(nextPackage.price)} GPK)
+        {/* Package Rules */}
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-6 mb-8">
+          <h3 className="text-lg font-semibold text-blue-900 mb-4">📋 Package Purchase Rules</h3>
+          <ul className="list-disc list-inside space-y-2 text-blue-800">
+            <li>All users must start with the <strong>Starter</strong> package (₹2,500)</li>
+            <li>Upgrade path: Starter → Silver → Gold → Platinum → Diamond</li>
+            <li>You cannot skip packages - each upgrade must be sequential</li>
+            <li>Only Silver+ packages are eligible for Global Royalty (15% pool every 90 days)</li>
+          </ul>
         </div>
-      )}
+
+        {/* Packages Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-6 mb-12">
+          {packages.map((pkg) => {
+            const IconComponent = packageIcons[pkg.id as keyof typeof packageIcons] || Package;
+            const status = getPackageStatus(pkg);
+            const isOwned = status.status === 'owned';
+            const isLocked = status.status === 'locked';
+            const isPurchasing = purchasingPackage === pkg.id;
+
+            return (
+              <div
+                key={pkg.id}
+                className={`relative bg-white rounded-2xl shadow-lg hover:shadow-xl transition-all duration-300 ${
+                  isOwned ? 'ring-2 ring-green-500' : ''
+                } ${isLocked ? 'opacity-75' : ''}`}
+              >
+                {/* Package Header */}
+                <div className={`bg-gradient-to-r ${packageColors[pkg.id as keyof typeof packageColors]} text-white p-6 rounded-t-2xl relative overflow-hidden`}>
+                  {isOwned && (
+                    <div className="absolute top-2 right-2">
+                      <CheckCircle2 className="w-6 h-6 text-white" />
+                    </div>
+                  )}
+                  <div className="text-center">
+                    <IconComponent className="w-12 h-12 mx-auto mb-2" />
+                    <h3 className="text-xl font-bold capitalize">{pkg.name}</h3>
+                    <p className="text-2xl font-bold mt-2">{formatCurrency(pkg.price)}</p>
+                  </div>
                 </div>
-              );
-            })()}
+
+                {/* Package Body */}
+                <div className="p-6">
+                  {/* Global Royalty Badge */}
+                  {pkg.global_royalty_eligible && (
+                    <div className="mb-4">
+                      <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                        🌍 {pkg.global_royalty_share_percent}% Global Royalty
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Description */}
+                  {pkg.description && (
+                    <p className="text-gray-600 text-sm mb-4">{pkg.description}</p>
+                  )}
+
+                  {/* Benefits */}
+                  <div className="space-y-2 mb-6">
+                    {pkg.benefits.map((benefit, index) => (
+                      <div key={index} className="flex items-start space-x-2">
+                        <Check className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                        <span className="text-sm text-gray-700">{benefit}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Action Button */}
+                  <button
+                    onClick={() => handlePurchase(pkg)}
+                    disabled={isOwned || isLocked || isPurchasing}
+                    className={`w-full py-3 px-4 rounded-lg font-semibold transition-all duration-300 flex items-center justify-center space-x-2 ${
+                      isOwned
+                        ? 'bg-green-100 text-green-700 cursor-default'
+                        : isLocked
+                        ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                        : 'bg-blue-600 text-white hover:bg-blue-700 hover:shadow-lg'
+                    }`}
+                  >
+                    {isPurchasing ? (
+                      <>
+                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                        <span>Processing...</span>
+                      </>
+                    ) : (
+                      <>
+                        <status.icon className="w-4 h-4" />
+                        <span>{status.text}</span>
+                      </>
+                    )}
+                  </button>
+
+                  {/* Additional Info for Locked Packages */}
+                  {isLocked && (
+                    <p className="text-xs text-gray-500 mt-2 text-center">
+                      Complete previous packages to unlock
+                    </p>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Income Plan Summary */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          {/* Direct Referral Income */}
+          <div className="bg-white rounded-2xl shadow-lg p-6">
+            <div className="text-center mb-4">
+              <div className="bg-green-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-3">
+                <span className="text-2xl">🎯</span>
+              </div>
+              <h3 className="text-xl font-bold text-gray-900">Direct Referral</h3>
+              <p className="text-3xl font-bold text-green-600">25%</p>
+            </div>
+            <ul className="space-y-2 text-sm text-gray-600">
+              <li>• One-time income on first package purchase</li>
+              <li>• 25% of package amount</li>
+              <li>• Only from direct referrals</li>
+              <li>• Instant credit to wallet</li>
+            </ul>
+          </div>
+
+          {/* Level Income */}
+          <div className="bg-white rounded-2xl shadow-lg p-6">
+            <div className="text-center mb-4">
+              <div className="bg-blue-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-3">
+                <span className="text-2xl">🏆</span>
+              </div>
+              <h3 className="text-xl font-bold text-gray-900">Level Income</h3>
+              <p className="text-3xl font-bold text-blue-600">Up to 15%</p>
+            </div>
+            <ul className="space-y-2 text-sm text-gray-600">
+              <li>• Levels 1-7: 1% each</li>
+              <li>• Level 8: 2%</li>
+              <li>• Levels 9-10: 3% each</li>
+              <li>• Qualification required for each level</li>
+            </ul>
+          </div>
+
+          {/* Global Royalty */}
+          <div className="bg-white rounded-2xl shadow-lg p-6">
+            <div className="text-center mb-4">
+              <div className="bg-purple-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-3">
+                <span className="text-2xl">🌍</span>
+              </div>
+              <h3 className="text-xl font-bold text-gray-900">Global Royalty</h3>
+              <p className="text-3xl font-bold text-purple-600">15%</p>
+            </div>
+            <ul className="space-y-2 text-sm text-gray-600">
+              <li>• 15% of total system sales</li>
+              <li>• Distributed every 90 days</li>
+              <li>• Only Silver+ packages eligible</li>
+              <li>• Share based on package level</li>
+            </ul>
+          </div>
+        </div>
+
+        {/* Current Status */}
+        {userPackages.length > 0 && (
+          <div className="mt-8 bg-white rounded-2xl shadow-lg p-6">
+            <h3 className="text-xl font-bold text-gray-900 mb-4">Your Current Packages</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {userPackages.map((userPkg) => (
+                <div key={userPkg.id} className={`border-2 ${packageBorders[userPkg.package_id as keyof typeof packageBorders]} rounded-lg p-4`}>
+                  <div className="flex items-center justify-between mb-2">
+                    <h4 className="font-semibold capitalize">{userPkg.package_id}</h4>
+                    <CheckCircle2 className="w-5 h-5 text-green-600" />
+                  </div>
+                  <p className="text-sm text-gray-600">
+                    Purchased: {new Date(userPkg.purchase_date).toLocaleDateString()}
+                  </p>
+                  <p className="text-sm text-gray-600">
+                    Amount: {formatCurrency(userPkg.amount_paid)}
+                  </p>
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </div>
-
-
-
-      {/* Packages Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {packages.map((pkg, index) => {
-          let status = '';
-          const sortedPackages = [...packages].sort((a, b) => a.price - b.price);
-          const currentIndex = user?.package_id ? sortedPackages.findIndex(p => p.id === user.package_id) : -1;
-          const sortedIndex = sortedPackages.findIndex(p => p.id === pkg.id);
-          if (user?.package_id === pkg.id) {
-            status = 'active';
-          } else if (sortedIndex === currentIndex - 1) {
-            status = 'upgrade_completed';
-          } else if (sortedIndex === currentIndex + 1) {
-            status = 'next_upgrade';
-          }
-          
-          return (
-          <div
-            key={pkg.id}
-              className={`bg-white rounded-xl shadow-lg border-2 transition-all duration-200 hover:shadow-xl relative ${
-                status === 'active'
-                ? 'border-green-500 bg-green-50' 
-                  : status === 'next_upgrade'
-                  ? 'border-blue-500 bg-blue-50'
-                  : status === 'upgrade_completed'
-                  ? 'border-gray-400 bg-gray-50'
-                : 'border-gray-200 hover:border-blue-300'
-            }`}
-          >
-              {/* Progression indicator */}
-              {status === 'next_upgrade' && (
-                <div className="absolute -top-3 left-1/2 transform -translate-x-1/2 bg-blue-500 text-white px-3 py-1 rounded-full text-xs font-medium">
-                  Next Upgrade
-                </div>
-              )}
-              {status === 'upgrade_completed' && (
-                <div className="absolute -top-3 left-1/2 transform -translate-x-1/2 bg-gray-400 text-white px-3 py-1 rounded-full text-xs font-medium">
-                  Upgrade Completed
-                </div>
-              )}
-              
-            <div className={`bg-gradient-to-r ${getPackageGradient(pkg.name)} p-6 rounded-t-xl text-white`}>
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-xl font-bold">{pkg.name}</h3>
-                  <p className="text-white/90">Package</p>
-                </div>
-                {getPackageIcon(pkg.name)}
-              </div>
-              <div className="mt-4">
-                <div className="text-3xl font-bold">{formatNumber(pkg.price)} GPK</div>
-                <div className="text-white/90">ROI: {formatNumber(pkg.roi)}%</div>
-              </div>
-            </div>
-            
-            <div className="p-6">
-              <div className="mb-4">
-                <p className="text-gray-600 text-sm">{pkg.description || 'No description available'}</p>
-              </div>
-              
-              <div className="space-y-2 mb-6">
-                <h4 className="font-semibold text-gray-900">Benefits:</h4>
-                <ul className="space-y-1">
-                  {pkg.benefits.map((benefit, index) => (
-                    <li key={index} className="flex items-start">
-                      <Check className="h-4 w-4 text-green-500 mr-2 mt-0.5 flex-shrink-0" />
-                      <span className="text-gray-700 text-sm">{benefit}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-              
-              <div className="space-y-3">
-                  {status === 'active' ? (
-                  <div className="flex items-center justify-center py-2 px-4 bg-green-100 text-green-800 rounded-lg">
-                    <Check className="h-4 w-4 mr-2" />
-                    <span className="font-medium">Active Package</span>
-                  </div>
-                ) : status === 'upgrade_completed' ? (
-                  <div className="flex items-center justify-center py-2 px-4 bg-gray-100 text-gray-700 rounded-lg">
-                    <Check className="h-4 w-4 mr-2" />
-                    <span className="font-medium">Upgrade Completed</span>
-                  </div>
-                ) : (
-                  <button
-                    onClick={() => handlePackageSelect(pkg)}
-                      disabled={!canActivatePackage(pkg.price) || status !== 'next_upgrade'}
-                    className={`w-full py-2 px-4 rounded-lg font-medium transition-colors ${
-                        canActivatePackage(pkg.price) && status === 'next_upgrade'
-                        ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                        : 'bg-gray-200 text-gray-500 cursor-not-allowed'
-                    }`}
-                  >
-                      {status === 'insufficient_balance' && 'Insufficient Balance'}
-                      {status === 'upgrade_required' && 'Upgrade Required'}
-                      {status === 'next_upgrade' && (user?.package_id ? 'Upgrade Package' : 'Activate Package')}
-                  </button>
-                )}
-                
-                <div className="text-center">
-                  <span className="text-xs text-gray-500">
-                    Estimated ROI: ${formatNumber((pkg.price || 0) * (pkg.roi || 0) / 100)}
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-          );
-        })}
-      </div>
-
-      {/* Confirmation Modal */}
-      {showConfirmation && selectedPackage && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-lg max-w-md w-full p-6">
-            <h3 className="text-lg font-bold text-gray-900 mb-4">Confirm Package Activation</h3>
-            
-            {error && (
-              <div className="bg-red-50 border border-red-200 text-red-700 p-3 rounded-lg mb-4">
-                {error}
-              </div>
-            )}
-            
-            <div className="space-y-4 mb-6">
-              <div className="flex justify-between">
-                <span className="text-gray-600">Package:</span>
-                <span className="font-medium">{selectedPackage.name}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-600">Price:</span>
-                <span className="font-medium">{formatNumber(selectedPackage.price)} GPK</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-600">Current Balance:</span>
-                <span className="font-medium">{formatNumber(user.wallet_balance)} GPK</span>
-              </div>
-              <div className="flex justify-between border-t pt-2">
-                <span className="text-gray-600">Balance After:</span>
-                <span className="font-medium">
-                  {formatNumber((user.wallet_balance || 0) - (selectedPackage.price || 0))} GPK
-                </span>
-              </div>
-            </div>
-            
-            <div className="flex space-x-3">
-              <button
-                onClick={() => {
-                  setShowConfirmation(false);
-                  setError(null);
-                }}
-                className="flex-1 py-2 px-4 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
-                disabled={loading.activation}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handlePackageActivation}
-                className="flex-1 py-2 px-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center justify-center"
-                disabled={loading.activation}
-              >
-                {loading.activation ? (
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                ) : null}
-                Confirm
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Package Comparison */}
-      <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
-        <h3 className="text-lg font-semibold text-gray-900 mb-4">Package Comparison</h3>
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead>
-              <tr className="border-b">
-                <th className="text-left py-2 px-4 text-sm font-medium text-gray-600">Feature</th>
-                {packages.map((pkg) => (
-                  <th key={pkg.id} className="text-center py-2 px-4 text-sm font-medium text-gray-600">
-                    {pkg.name}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              <tr className="border-b">
-                <td className="py-3 px-4 text-sm text-gray-900">Price (GPK)</td>
-                {packages.map((pkg) => (
-                  <td key={pkg.id} className="py-3 px-4 text-sm text-center font-medium">
-                    {formatNumber(pkg.price)}
-                  </td>
-                ))}
-              </tr>
-              <tr className="border-b">
-                <td className="py-3 px-4 text-sm text-gray-900">ROI (%)</td>
-                {packages.map((pkg) => (
-                  <td key={pkg.id} className="py-3 px-4 text-sm text-center font-medium">
-                    {formatNumber(pkg.roi)}%
-                  </td>
-                ))}
-              </tr>
-              <tr className="border-b">
-                <td className="py-3 px-4 text-sm text-gray-900">Direct Referral</td>
-                {packages.map((pkg) => (
-                  <td key={pkg.id} className="py-3 px-4 text-sm text-center">
-                    <Check className="h-4 w-4 text-green-500 mx-auto" />
-                  </td>
-                ))}
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
     </div>
   );
-};
-
-export default Packages;
+}
